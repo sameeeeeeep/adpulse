@@ -381,12 +381,13 @@ var INSTALL_URL = "https://thelastprompt.ai/switchboard/";
 var STORE_KEY = "adpulse:v1";
 var relay = null;
 var notInstalled = false;
+var brand = null;
 var rows = null;
 var rawCsv = "";
 var srcLabel = "";
 var report = null;
 var analysing = false;
-var cancelled = false;
+var runSeq = 0;
 var pulling = false;
 var pullSeq = 0;
 var SAMPLE = [
@@ -457,6 +458,8 @@ function loadData(text, source) {
   };
   if (col.name === -1 || col.spend === -1)
     throw new Error("couldn't find \u201CCampaign name\u201D + \u201CAmount spent\u201D columns \u2014 is this a Meta Ads Manager export?");
+  const cur = String(grid[0][col.spend] || "").match(/\(([A-Z]{3})\)/);
+  setCurrency(cur ? cur[1] : "INR");
   const pick = (r, i) => i === -1 ? "" : (r[i] ?? "").trim();
   const parsed = grid.slice(1).map((r) => {
     const spend = num(pick(r, col.spend));
@@ -488,7 +491,22 @@ function loadData(text, source) {
   reflect();
 }
 var hasAdset = true;
-var fmtIN = (n, d = 0) => Number(n).toLocaleString("en-IN", { maximumFractionDigits: d });
+var currency = "INR";
+var curSym = "\u20B9";
+function setCurrency(code) {
+  currency = code || "INR";
+  if (currency === "INR") {
+    curSym = "\u20B9";
+    return;
+  }
+  try {
+    const part = new Intl.NumberFormat("en", { style: "currency", currency, currencyDisplay: "narrowSymbol" }).formatToParts(0).find((p) => p.type === "currency");
+    curSym = part ? part.value : currency + " ";
+  } catch {
+    curSym = currency + " ";
+  }
+}
+var fmtIN = (n, d = 0) => Number(n).toLocaleString(currency === "INR" ? "en-IN" : "en-US", { maximumFractionDigits: d });
 var trunc = (s, n) => s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
 function totals() {
   const spend = rows.reduce((a, r) => a + r.spend, 0);
@@ -524,22 +542,22 @@ function renderTape() {
   const stats = $("stats");
   stats.textContent = "";
   stats.append(
-    statCell("total spend", "\u20B9" + fmtIN(t.spend), rows[0].range || rows.length + " campaigns", ""),
-    statCell("blended roas", t.blended.toFixed(2) + "\xD7", "\u20B9" + fmtIN(t.value) + " revenue", t.blended >= 3 ? "good" : t.blended >= 1 ? "hot" : "bad"),
-    statCell("purchases", fmtIN(t.purch), t.purch > 0 ? "\u20B9" + fmtIN(t.spend / t.purch) + " blended CPA" : "no conversions", ""),
-    statCell("worst cpa", t.worst && t.worst.purch > 0 ? "\u20B9" + fmtIN(t.worst.spend / t.worst.purch) : "\u221E", t.worst ? trunc(t.worst.name, 30) + (t.worst.purch === 0 ? " \xB7 0 purchases" : "") : "\u2014", "bad"),
+    statCell("total spend", curSym + fmtIN(t.spend), rows[0].range || rows.length + " campaigns", ""),
+    statCell("blended roas", t.blended.toFixed(2) + "\xD7", curSym + fmtIN(t.value) + " revenue", t.blended >= 3 ? "good" : t.blended >= 1 ? "hot" : "bad"),
+    statCell("purchases", fmtIN(t.purch), t.purch > 0 ? curSym + fmtIN(t.spend / t.purch) + " blended CPA" : "no conversions", ""),
+    statCell("worst cpa", t.worst && t.worst.purch > 0 ? curSym + fmtIN(t.worst.spend / t.worst.purch) : "\u221E", t.worst ? trunc(t.worst.name, 30) + (t.worst.purch === 0 ? " \xB7 0 purchases" : "") : "\u2014", "bad"),
     statCell("best campaign", t.best ? t.best.roas.toFixed(1) + "\xD7" : "\u2014", t.best ? trunc(t.best.name, 30) : "\u2014", "good")
   );
   const cols = [
     { h: "Campaign", k: "name", cls: (r) => "name" },
     ...hasAdset ? [{ h: "Ad set", k: "adset" }] : [],
-    { h: "Spend \u20B9", k: "spend", n: 1, f: (v) => fmtIN(v) },
+    { h: "Spend " + curSym.trim(), k: "spend", n: 1, f: (v) => fmtIN(v) },
     { h: "Impr", k: "impr", n: 1, f: (v) => fmtIN(v) },
     { h: "Clicks", k: "clicks", n: 1, f: (v) => fmtIN(v) },
     { h: "CTR", k: "ctr", n: 1, f: (v) => v ? v.toFixed(2) + "%" : "\u2014" },
-    { h: "CPC \u20B9", k: "cpc", n: 1, f: (v) => v ? v.toFixed(2) : "\u2014" },
+    { h: "CPC " + curSym.trim(), k: "cpc", n: 1, f: (v) => v ? v.toFixed(2) : "\u2014" },
     { h: "Purch", k: "purch", n: 1, f: (v) => fmtIN(v) },
-    { h: "Value \u20B9", k: "value", n: 1, f: (v) => fmtIN(v) },
+    { h: "Value " + curSym.trim(), k: "value", n: 1, f: (v) => fmtIN(v) },
     { h: "ROAS", k: "roas", n: 1, f: (v) => v.toFixed(2) + "\xD7", cls: (r) => r.roas >= 3 ? "up" : r.roas < 1 ? "down" : "" },
     { h: "Freq", k: "freq", n: 1, f: (v) => v ? v.toFixed(1) : "\u2014", cls: (r) => r.freq >= 5 ? "warm" : "" }
   ];
@@ -569,11 +587,25 @@ function renderTape() {
   const box = $("previewbox");
   box.textContent = "";
   box.append(table);
-  $("tape-cap").textContent = "";
-  const capB = document.createElement("b");
-  capB.textContent = srcLabel === "sample" ? "sample account \xB7 Verra Skincare (DTC)" : srcLabel === "restored" ? "restored from your last session" : srcLabel === "live" ? "pulled live from your Ads Manager \u2014 via your own Meta connector" : "your export";
-  $("tape-cap").append(capB, ` \u2014 ${rows.length} campaigns parsed in this tab, all rows shown. ` + (srcLabel === "sample" ? "Paste your own export above to replace it." : ""));
+  renderTapeCaption();
   $("tape").hidden = false;
+}
+function renderTapeCaption() {
+  const cap = $("tape-cap");
+  cap.textContent = "";
+  if (!rows) return;
+  if (srcLabel === "sample") {
+    const badge = document.createElement("span");
+    badge.className = "samplebadge";
+    badge.textContent = "sample";
+    const b = document.createElement("b");
+    b.textContent = "Verra Skincare (DTC) \u2014 not your data.";
+    cap.append(badge, b, relay ? ` ${rows.length} campaigns parsed in this tab. You're connected \u2014 pull your live account above to replace it.` : ` ${rows.length} campaigns parsed in this tab. Connect Switchboard to pull your live account, or paste an export.`);
+  } else {
+    const b = document.createElement("b");
+    b.textContent = srcLabel === "restored" ? "restored from your last session" : srcLabel === "live" ? "pulled live from your Ads Manager \u2014 via your own Meta connector" : "your export";
+    cap.append(b, ` \u2014 ${rows.length} campaigns parsed in this tab, all rows shown.`);
+  }
 }
 mountConnect($("chip-dock"), {
   scope: { reason: "diagnose your Meta ads performance", models: ["sonnet"] },
@@ -581,32 +613,152 @@ mountConnect($("chip-dock"), {
   onConnect: (r) => {
     relay = r;
     reflect();
+    loadBrand();
   },
   onDisconnect: () => {
     relay = null;
+    brand = null;
+    renderBrandLine();
+    rebuildBrandChips();
     reflect();
-  }
+  },
+  onProjectChange: () => loadBrand()
+  // chip-menu "Switch ▸" (or panel switch) re-reads the lent brand
 });
 (async () => {
   const r = await whenRelayReady(2e3, { installUrl: INSTALL_URL });
   if (r && "connect" in r) {
     const grant = await r.permissions().catch(() => null);
-    if (grant) relay = r;
+    if (grant) {
+      relay = r;
+      loadBrand();
+    }
   } else if (r && r.installed === false) {
     notInstalled = true;
   }
   reflect();
 })();
+function normalizeBrand(ctx) {
+  const d = ctx && ctx.data || {};
+  const arr = (v) => Array.isArray(v) ? v.filter(Boolean).map(String) : [];
+  let palette = arr(d.palette).filter((c) => !/^\[object/i.test(c));
+  if (!palette.length && Array.isArray(d.paletteRich))
+    palette = d.paletteRich.map((s) => s && s.hex).filter(Boolean).map(String);
+  return {
+    name: ctx.name || d.name || "Brand",
+    voice: String(d.voice || d.vibe || d.positioning || "").trim(),
+    positioning: String(d.positioning || "").trim(),
+    audience: String(d.audience || "").trim(),
+    palette,
+    products: arr(d.products).length ? arr(d.products) : arr(d.range)
+  };
+}
+async function loadBrand() {
+  if (!relay) return;
+  try {
+    const ctx = await relay.context.active();
+    brand = ctx ? normalizeBrand(ctx) : null;
+  } catch {
+    brand = null;
+  }
+  renderBrandLine();
+  rebuildBrandChips();
+  reflect();
+}
+function renderBrandLine() {
+  const line = $("brand-line");
+  const sw = $("brand-swatches");
+  sw.textContent = "";
+  if (!relay) {
+    line.hidden = true;
+    return;
+  }
+  line.hidden = false;
+  const name = $("brand-name");
+  if (brand) {
+    $("brand-kicker").textContent = "diagnosing for";
+    name.textContent = brand.name;
+    name.classList.remove("dim");
+    for (const c of brand.palette.slice(0, 4)) {
+      const s = document.createElement("span");
+      s.className = "sw";
+      s.style.background = c;
+      sw.append(s);
+    }
+    $("brand-switch").textContent = "switch";
+  } else {
+    $("brand-kicker").textContent = "brand context";
+    name.textContent = "none lent \u2014 verdicts stay generic";
+    name.classList.add("dim");
+    $("brand-switch").textContent = "load a brand";
+  }
+}
+$("brand-switch").addEventListener("click", async () => {
+  if (!relay) return;
+  const b = $("brand-switch");
+  const prev = b.textContent;
+  b.disabled = true;
+  b.textContent = "choose in Switchboard\u2026";
+  try {
+    const ctx = await relay.context.pick();
+    if (ctx) {
+      brand = normalizeBrand(ctx);
+      renderBrandLine();
+      rebuildBrandChips();
+      reflect();
+    } else b.textContent = prev;
+  } catch {
+    b.textContent = prev;
+  } finally {
+    b.disabled = false;
+    if (brand) b.textContent = "switch";
+  }
+});
+function syncChips() {
+  const v = $("focus-in").value;
+  document.querySelectorAll(".steer-chip").forEach((c) => c.classList.toggle("on", c.dataset.focus === v));
+}
+$("chips").addEventListener("click", (e) => {
+  const chip = e.target.closest(".steer-chip");
+  if (!chip) return;
+  $("focus-in").value = chip.dataset.focus;
+  syncChips();
+  persist();
+});
+$("focus-in").addEventListener("input", () => {
+  syncChips();
+  persist();
+});
+function rebuildBrandChips() {
+  document.querySelectorAll(".steer-chip.bchip").forEach((c) => c.remove());
+  if (brand) {
+    const sug = [];
+    if (brand.audience) sug.push(`Is spend actually reaching ${brand.audience}?`);
+    if (brand.positioning) sug.push(`Which campaigns drift off ${brand.name}'s positioning?`);
+    else sug.push(`What should ${brand.name} scale tomorrow?`);
+    for (const s of sug.slice(0, 2)) {
+      const b = document.createElement("button");
+      b.className = "steer-chip bchip";
+      b.dataset.focus = s;
+      b.textContent = trunc(s, 58);
+      $("chips").append(b);
+    }
+  }
+  syncChips();
+}
 function reflect() {
   const haveData = !!rows && rows.length > 0;
   $("analyse").disabled = !relay || !haveData || analysing || pulling;
   $("rerun").disabled = !relay || !haveData || analysing || pulling;
   $("pull-live").disabled = !relay || pulling || analysing;
+  $("load-sample").hidden = !!relay;
+  $("pull-sub").textContent = relay ? "reads your last 30 days through your own Meta connector \u2014 nothing leaves this tab" : "connect Switchboard (top right) to pull your live account \u2014 everything below works without it";
   $("pull-live").title = relay ? "reads your Ads Manager through your own Meta connector \u2014 nothing touches our servers (we have none)" : "connect Switchboard (top right) first";
   const hint = $("conn-hint");
   hint.textContent = "";
   if (relay) {
-    hint.append("connected \u2014 the diagnosis runs on ", strong("your"), " Claude. " + (haveData ? "" : "Load the sample, paste an export, or pull live."));
+    const brandBit = brand ? ` Verdicts are judged against ${brand.name}'s positioning.` : "";
+    hint.append("connected \u2014 the diagnosis runs on ", strong("your"), " Claude." + brandBit + (haveData ? "" : " Pull live or paste an export first."));
   } else if (notInstalled) {
     const a = document.createElement("a");
     a.href = INSTALL_URL;
@@ -615,25 +767,15 @@ function reflect() {
     a.textContent = "get Switchboard \u2192";
     hint.append("everything above works without AI. To run the diagnosis on your own Claude, ", a);
   } else {
-    hint.append("form's live, sample's loaded \u2014 ", strong("connect Switchboard"), " (top right) to run the diagnosis.");
+    hint.append("the sample is loaded and explorable \u2014 ", strong("connect Switchboard"), " (top right) to pull your live account and run the diagnosis.");
   }
+  if (rows) renderTapeCaption();
 }
 function strong(t) {
   const b = document.createElement("b");
   b.textContent = t;
   return b;
 }
-document.querySelectorAll(".steer-chip").forEach((chip) => {
-  chip.addEventListener("click", () => {
-    $("focus-in").value = chip.dataset.focus;
-    document.querySelectorAll(".steer-chip").forEach((c) => c.classList.toggle("on", c === chip));
-    persist();
-  });
-});
-$("focus-in").addEventListener("input", () => {
-  document.querySelectorAll(".steer-chip").forEach((c) => c.classList.toggle("on", c.dataset.focus === $("focus-in").value));
-  persist();
-});
 function ingest(text, source) {
   try {
     if (!text.trim()) {
@@ -672,6 +814,7 @@ function readFile(file) {
   const reader = new FileReader();
   reader.onload = () => {
     $("csv-in").value = String(reader.result);
+    $("paste-alt").open = true;
     ingest(String(reader.result), "file");
   };
   reader.onerror = () => {
@@ -773,6 +916,7 @@ async function pullLive() {
     $("csv-in").value = csv;
     ingest(csv, "live");
     $("tape").scrollIntoView({ behavior: "smooth", block: "start" });
+    if (rows && rows.length && !analysing) void analyse();
   } catch (err) {
     if (myRun !== pullSeq) return;
     try {
@@ -796,14 +940,25 @@ function buildPrompt() {
   const t = totals();
   let csv = rawCsv.trim();
   if (csv.length > 28e3) csv = csv.slice(0, 28e3) + "\n[...truncated]";
+  const brandBlock = brand ? [
+    "BRAND CONTEXT (the user lent this brand via Switchboard \u2014 judge the numbers against it):",
+    `Brand: ${brand.name}.`,
+    brand.positioning ? `Positioning: ${brand.positioning}.` : "",
+    brand.audience ? `Audience: ${brand.audience}.` : "",
+    brand.voice ? `Voice: ${brand.voice}.` : "",
+    brand.products.length ? `Products: ${brand.products.join(", ")}.` : "",
+    "Use it: judge CPA/CAC against the price point the positioning implies when one is stated; flag campaigns whose naming or targeting reads off-audience; wins, leaks and per-campaign verdicts should call out brand fit, not just ROAS."
+  ].filter(Boolean).join(" ") : "";
   return [
-    "You are AdPulse, a blunt, numbers-first Meta Ads performance analyst. A founder exported the data below from Meta Ads Manager. Currency is INR (\u20B9) unless the headers clearly say otherwise; treat the export window as roughly one month.",
-    `Pre-computed aggregates (trust these): total spend \u20B9${fmtIN(t.spend)}; blended ROAS ${t.blended.toFixed(2)}; total purchases ${fmtIN(t.purch)}; total purchase value \u20B9${fmtIN(t.value)}; ${rows.length} campaigns.`,
+    `You are AdPulse, a blunt, numbers-first Meta Ads performance analyst. A founder exported the data below from Meta Ads Manager. Currency is ${currency} (per the spend header); treat the export window as roughly one month.`,
+    `Pre-computed aggregates (trust these): total spend ${curSym}${fmtIN(t.spend)}; blended ROAS ${t.blended.toFixed(2)}; total purchases ${fmtIN(t.purch)}; total purchase value ${curSym}${fmtIN(t.value)}; ${rows.length} campaigns.`,
+    brandBlock,
     "CSV EXPORT:\n" + csv,
     "ANALYSIS FOCUS (weigh the whole diagnosis toward this): " + focus,
-    'Respond with ONLY one JSON object \u2014 no prose, no markdown fences \u2014 in exactly this shape:\n{"score": <integer 0-100, overall account health: 0 = burning cash, 100 = dialed in>, "headline": "<one blunt verdict sentence, max 120 chars>", "wins": [{"title": "...", "detail": "..."}], "leaks": [{"title": "...", "detail": "...", "monthlyBurn": <estimated INR wasted per month, plain number>}], "actions": [{"title": "...", "impact": "high"|"medium", "effort": "low"|"medium"|"high", "detail": "..."}], "campaigns": [{"name": "<campaign name copied EXACTLY from the data>", "verdict": "scale"|"keep"|"fix"|"kill", "note": "<max 90 chars>"}]}',
+    `Respond with ONLY one JSON object \u2014 no prose, no markdown fences \u2014 in exactly this shape:
+{"score": <integer 0-100, overall account health: 0 = burning cash, 100 = dialed in>, "headline": "<one blunt verdict sentence, max 120 chars>", "wins": [{"title": "...", "detail": "..."}], "leaks": [{"title": "...", "detail": "...", "monthlyBurn": <estimated ${currency} wasted per month, plain number>}], "actions": [{"title": "...", "impact": "high"|"medium", "effort": "low"|"medium"|"high", "detail": "..."}], "campaigns": [{"name": "<campaign name copied EXACTLY from the data>", "verdict": "scale"|"keep"|"fix"|"kill", "note": "<max 90 chars>"}]}`,
     "Rules: 2-4 wins, 2-4 leaks, 4-6 actions ordered most-urgent first, and one campaigns entry per campaign in the data. Cite real numbers from the data (ROAS, CPA, frequency, spend) in every detail. Each detail under 220 chars. Specific beats generic; a founder acts on this tomorrow morning."
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 var STATUS_TAIL = [
   "checking spend concentration\u2026",
@@ -820,9 +975,10 @@ function setLive(on) {
   if (on) {
     $("live-line").textContent = `reading ${rows.length} campaigns\u2026`;
     $("live-meta").textContent = "0.0 kb";
+    const tail = brand ? [...STATUS_TAIL, `judging brand fit for ${brand.name}\u2026`] : STATUS_TAIL;
     let i = 0;
     liveTimer = setInterval(() => {
-      $("live-line").textContent = STATUS_TAIL[i % STATUS_TAIL.length];
+      $("live-line").textContent = tail[i % tail.length];
       i++;
     }, 2400);
   } else {
@@ -832,14 +988,14 @@ function setLive(on) {
 }
 async function analyse() {
   if (!relay || !rows || analysing) return;
-  cancelled = false;
+  const myRun = ++runSeq;
   setLive(true);
   $("errbox").hidden = true;
   $("livebox").scrollIntoView({ behavior: "smooth", block: "nearest" });
   let text = "";
   try {
     for await (const d of relay.stream({ prompt: buildPrompt() })) {
-      if (cancelled) break;
+      if (myRun !== runSeq) return;
       if (d.type === "text") {
         text += d.text;
         $("live-meta").textContent = (text.length / 1024).toFixed(1) + " kb";
@@ -847,7 +1003,7 @@ async function analyse() {
         throw new Error(d.error?.message || "stream error");
       }
     }
-    if (cancelled) return;
+    if (myRun !== runSeq) return;
     const m = text.match(/\{[\s\S]*\}/);
     let data = null;
     if (m) {
@@ -862,16 +1018,17 @@ async function analyse() {
     renderReport();
     $("report").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (err) {
+    if (myRun !== runSeq) return;
     showError(err);
   } finally {
-    setLive(false);
+    if (myRun === runSeq) setLive(false);
   }
 }
 $("analyse").addEventListener("click", analyse);
 $("rerun").addEventListener("click", analyse);
 $("retry").addEventListener("click", analyse);
 $("cancel").addEventListener("click", () => {
-  cancelled = true;
+  runSeq++;
   setLive(false);
 });
 $("focus-in").addEventListener("keydown", (e) => {
@@ -918,12 +1075,12 @@ function svgEl(tag, attrs, text) {
 }
 function renderDial(score) {
   const s = Math.max(0, Math.min(100, Math.round(Number(score) || 0)));
-  const color = s >= 70 ? "var(--green)" : s >= 40 ? "var(--amber)" : "var(--red)";
+  const color = s >= 70 ? "var(--ok)" : s >= 40 ? "var(--warn)" : "var(--danger)";
   const ARC = "M 24 106 A 76 76 0 0 1 176 106";
   const svg = svgEl("svg", { viewBox: "0 0 200 122", width: "206", height: "126", role: "img", "aria-label": `account health ${s} of 100` });
   svg.append(
-    svgEl("path", { d: ARC, fill: "none", style: "stroke:var(--hair-2)", "stroke-width": "10", "stroke-linecap": "round" }),
-    svgEl("path", { class: "arc-val", d: ARC, fill: "none", style: "stroke:" + color, "stroke-width": "10", "stroke-linecap": "round", pathLength: "100", "stroke-dasharray": s + " 100" }),
+    svgEl("path", { d: ARC, fill: "none", style: "stroke:var(--edge)", "stroke-width": "10", "stroke-linecap": "round" }),
+    svgEl("path", { d: ARC, fill: "none", style: "stroke:" + color, "stroke-width": "10", "stroke-linecap": "round", pathLength: "100", "stroke-dasharray": s + " 100" }),
     svgEl("text", { class: "big", x: "100", y: "95", "text-anchor": "middle" }, String(s)),
     svgEl("text", { class: "sub", x: "100", y: "115", "text-anchor": "middle" }, "/ 100 ACCOUNT HEALTH")
   );
@@ -932,7 +1089,7 @@ function renderDial(score) {
   dial.append(svg);
 }
 function burnLine(b) {
-  if (typeof b === "number" && isFinite(b) && b > 0) return "\u25BC \u20B9" + fmtIN(b) + " / mo burn";
+  if (typeof b === "number" && isFinite(b) && b > 0) return "\u25BC " + curSym + fmtIN(b) + " / mo burn";
   const s = String(b ?? "").trim();
   return s && s !== "undefined" && s !== "null" ? "\u25BC " + s.slice(0, 60) : null;
 }
@@ -970,6 +1127,7 @@ function renderReport() {
   if (!report) return;
   renderDial(report.score);
   $("headline").textContent = report.headline;
+  $("verdict-sig").textContent = brand ? `account health \xB7 verdict for ${brand.name}` : "account health \xB7 verdict";
   const wins = $("wins");
   wins.textContent = "";
   if (report.wins.length) report.wins.forEach((w) => wins.append(card("win", w.title, w.detail)));
@@ -1058,10 +1216,11 @@ function persist() {
   }
   if (saved?.report) report = saved.report ? normalize(saved.report) : null;
   $("focus-in").value = saved?.focus || "Find wasted spend";
-  document.querySelectorAll(".steer-chip").forEach((c) => c.classList.toggle("on", c.dataset.focus === $("focus-in").value));
+  syncChips();
   if (saved?.csv) {
     $("csv-in").value = saved.csv;
     ingest(saved.csv, saved.source === "sample" ? "sample" : "restored");
+    if (saved.source !== "sample" && saved.source !== "live") $("paste-alt").open = true;
   } else {
     $("csv-in").value = SAMPLE;
     ingest(SAMPLE, "sample");
