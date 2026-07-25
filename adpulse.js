@@ -1,7 +1,43 @@
 // ../../packages/protocol/dist/version.js
 var PROVIDER_GLOBAL = "claude";
 
+// ../../packages/protocol/dist/storage.js
+var STORAGE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+function isValidStorageKey(key) {
+  return typeof key === "string" && STORAGE_KEY_RE.test(key);
+}
+
+// ../../packages/protocol/dist/errors.js
+var BYOPErrorCode = {
+  /** User rejected the connect/consent request. (≈ 4001) */
+  USER_REJECTED: 4001,
+  /** Origin is not connected / has no grant for this method. (≈ 4100) */
+  UNAUTHORIZED: 4100,
+  /** Method exists but the origin's scope doesn't cover it (model/tool not granted). */
+  SCOPE_EXCEEDED: 4110,
+  /** A per-action write consent was denied by the user. */
+  CONSENT_DENIED: 4120,
+  /** Budget or rate limit hit (tokens/day or calls/min). */
+  BUDGET_EXCEEDED: 4290,
+  /** Unknown method. (≈ 4200) */
+  UNSUPPORTED_METHOD: 4200,
+  /** Bad params. (≈ -32602) */
+  INVALID_PARAMS: -32602,
+  /** The sidekick daemon is not installed / not reachable. The SDK maps this to its
+   *  "install the sidekick" fallback. */
+  PROVIDER_UNAVAILABLE: 4900,
+  /** Backend error (model/tool failed for a non-policy reason). */
+  BACKEND_ERROR: 4500
+};
+
 // ../../packages/sdk/dist/connect-chip.js
+function rungFromError(e) {
+  if (e?.code !== BYOPErrorCode.PROVIDER_UNAVAILABLE)
+    return null;
+  return e?.data?.reason === "unpaired" ? { kind: "unpaired" } : { kind: "unreachable" };
+}
+var CHROME_STORE_URL = "https://chromewebstore.google.com/detail/injmjolmnekmahlnackakiamjepegagb";
+var RELAY_DMG_URL = "https://github.com/sameeeeeeep/switchboard/releases/latest/download/Relay.dmg";
 var STYLE = `
 :host { all: initial; }
 * { box-sizing: border-box; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
@@ -46,6 +82,11 @@ var STYLE = `
   background: transparent; color: #B4BECE; font-size: 13px; font-weight: 500; cursor: pointer; }
 .menu .item:hover { background: #20262F; color: #E8EDF4; }
 .menu .foot { padding: 8px 10px 4px; font-size: 11px; font-weight: 500; color: #6E7C90; line-height: 1.4; }
+/* Setup-ladder pills (sidekick asleep / unpaired): quiet and informative, never red \u2014 nothing is
+   broken. Amber only while the daemon is unreachable; the glyph stays muted until it's reachable. */
+.dot { width: 7px; height: 7px; border-radius: 50%; background: #E8B84B; flex: none;
+  box-shadow: 0 0 8px rgba(232,184,75,.45); }
+.menu .body { padding: 8px 10px 2px; font-size: 12px; font-weight: 500; color: #B4BECE; line-height: 1.45; }
 `;
 function mountConnect(target, opts = {}) {
   const installUrl = opts.installUrl ?? "https://thelastprompt.ai/switchboard/";
@@ -64,6 +105,7 @@ function mountConnect(target, opts = {}) {
   let relay2 = null;
   let seq = 0;
   let wasConnected = false;
+  let lastProjectKey;
   let sessionDisconnected = false;
   const onDocClick = (e) => {
     if (menuOpen && !host.contains(e.target)) {
@@ -72,7 +114,21 @@ function mountConnect(target, opts = {}) {
     }
   };
   document.addEventListener("click", onDocClick);
-  function el(tag, cls, text) {
+  const initEvent = `${PROVIDER_GLOBAL}#initialized`;
+  let lateWatching = false;
+  const onLateInit = () => {
+    lateWatching = false;
+    window.removeEventListener(initEvent, onLateInit);
+    if (!destroyed)
+      void refresh();
+  };
+  function watchForLateProvider() {
+    if (lateWatching || destroyed)
+      return;
+    lateWatching = true;
+    window.addEventListener(initEvent, onLateInit);
+  }
+  function el2(tag, cls, text) {
     const n = document.createElement(tag);
     if (cls)
       n.className = cls;
@@ -86,24 +142,57 @@ function mountConnect(target, opts = {}) {
     if (destroyed || my !== seq)
       return;
     if (!(r instanceof Relay)) {
+      watchForLateProvider();
       state = { kind: "not-installed", installUrl };
       return render();
     }
     relay2 = r;
     subscribe(r);
-    const grant = sessionDisconnected ? null : await r.permissions().catch(() => null);
+    const h = await r.health();
+    if (destroyed || my !== seq)
+      return;
+    if (h && !h.reachable) {
+      state = { kind: "unreachable", appMissing: h.installedHere === false };
+      emitTransition(false);
+      return render();
+    }
+    if (h && !h.paired) {
+      state = { kind: "unpaired" };
+      emitTransition(false);
+      return render();
+    }
+    let permErr = null;
+    const grant = sessionDisconnected ? null : await r.permissions().catch((e) => {
+      permErr = e;
+      return null;
+    });
     if (destroyed || my !== seq)
       return;
     if (!grant) {
+      const rung = !h ? rungFromError(permErr) : null;
+      if (rung) {
+        state = rung;
+        emitTransition(false);
+        return render();
+      }
       state = { kind: "disconnected", relay: r };
       emitTransition(false);
       return render();
     }
-    const [user, project] = await Promise.all([r.identity(), r.context.active().catch(() => null)]);
+    const wantsContext = opts.context !== "none";
+    const [user, project] = await Promise.all([
+      r.identity(),
+      wantsContext ? r.context.active().catch(() => null) : Promise.resolve(null)
+    ]);
     if (destroyed || my !== seq)
       return;
+    const wasAlreadyConnected = wasConnected;
     state = { kind: "connected", relay: r, user, project };
     emitTransition(true);
+    const projKey = project ? project.id ?? project.name : null;
+    if (wasAlreadyConnected && lastProjectKey !== void 0 && projKey !== lastProjectKey)
+      opts.onProjectChange?.(project);
+    lastProjectKey = projKey;
     render();
   }
   function emitTransition(connected) {
@@ -126,6 +215,9 @@ function mountConnect(target, opts = {}) {
     r.on("disconnect", () => {
       void refresh();
     });
+    r.on("health", () => {
+      void refresh();
+    });
   }
   async function doConnect() {
     if (!relay2)
@@ -134,7 +226,19 @@ function mountConnect(target, opts = {}) {
       sessionDisconnected = false;
       await relay2.connect(opts.scope);
       await refresh();
-    } catch {
+    } catch (e) {
+      const err = e;
+      if (err?.code !== BYOPErrorCode.PROVIDER_UNAVAILABLE)
+        return;
+      await refresh();
+      if (state.kind === "disconnected") {
+        const rung = rungFromError(err);
+        if (rung) {
+          state = rung;
+          emitTransition(false);
+          render();
+        }
+      }
     }
   }
   async function doPick() {
@@ -142,8 +246,7 @@ function mountConnect(target, opts = {}) {
       return;
     menuOpen = false;
     render();
-    const project = await relay2.context.pick().catch(() => null);
-    opts.onProjectChange?.(project);
+    await relay2.context.pick().catch(() => null);
     await refresh();
   }
   async function doDisconnect() {
@@ -162,15 +265,109 @@ function mountConnect(target, opts = {}) {
     if (state.kind === "booting")
       return;
     if (state.kind === "not-installed") {
-      const b = el("button", "btn get");
-      b.append(el("span", "glyph"), el("span", void 0, "Get Switchboard"), el("span", "arr", "\u2197"));
-      b.onclick = () => window.open(state.kind === "not-installed" ? state.installUrl : installUrl, "_blank", "noopener");
-      mount.append(b);
+      const url = state.installUrl;
+      const wrap2 = el2("div", "wrap");
+      const b = el2("button", "btn get");
+      b.append(el2("span", "glyph"), el2("span", void 0, "Get Switchboard"), el2("span", "arr", "\u2197"));
+      b.onclick = (e) => {
+        e.stopPropagation();
+        menuOpen = !menuOpen;
+        render();
+      };
+      wrap2.append(b);
+      if (menuOpen) {
+        const menu = el2("div", "menu");
+        menu.append(el2("div", "body", "Two parts: the Chrome extension, then Relay for Mac."));
+        const store = el2("button", "item", "1 \xB7 Add to Chrome \u2197");
+        store.onclick = () => {
+          menuOpen = false;
+          render();
+          window.open(CHROME_STORE_URL, "_blank", "noopener");
+        };
+        const guide = el2("button", "item", "2 \xB7 Get Relay for Mac \u2197");
+        guide.onclick = () => {
+          menuOpen = false;
+          render();
+          window.open(url, "_blank", "noopener");
+        };
+        menu.append(store, guide);
+        wrap2.append(menu);
+      }
+      mount.append(wrap2);
+      return;
+    }
+    if (state.kind === "unreachable") {
+      const appMissing = state.appMissing === true;
+      const wrap2 = el2("div", "wrap");
+      const b = el2("button", "btn get");
+      b.append(el2("span", "glyph"), el2("span", void 0, appMissing ? "Get Relay for Mac" : "Your sidekick is asleep"), el2("span", appMissing ? "arr" : "dot", appMissing ? "\u2197" : void 0), ...appMissing ? [] : [el2("span", "caret", "\u25BE")]);
+      b.onclick = (e) => {
+        e.stopPropagation();
+        menuOpen = !menuOpen;
+        render();
+      };
+      wrap2.append(b);
+      if (menuOpen) {
+        const menu = el2("div", "menu");
+        if (appMissing) {
+          menu.append(el2("div", "body", "Extension \u2713 \u2014 now the other half: Relay, the Mac app that holds your Claude."));
+          const dl = el2("button", "item", "Download Relay.dmg \u2197");
+          dl.onclick = () => {
+            menuOpen = false;
+            render();
+            window.open(RELAY_DMG_URL, "_blank", "noopener");
+          };
+          menu.append(dl, el2("div", "sep"));
+        } else {
+          menu.append(el2("div", "body", "Open the Relay menubar app to wake it."));
+          const retry = el2("button", "item", "Retry");
+          retry.onclick = () => {
+            menuOpen = false;
+            render();
+            void refresh();
+          };
+          menu.append(retry, el2("div", "sep"));
+        }
+        const setup = el2("button", "item", "New here? Full setup \u2197");
+        setup.onclick = () => {
+          menuOpen = false;
+          render();
+          window.open(installUrl, "_blank", "noopener");
+        };
+        menu.append(setup);
+        wrap2.append(menu);
+      }
+      mount.append(wrap2);
+      return;
+    }
+    if (state.kind === "unpaired") {
+      const wrap2 = el2("div", "wrap");
+      const b = el2("button", "btn connect");
+      b.append(el2("span", "glyph"), el2("span", void 0, "Almost there \u2014 pair in the side panel"), el2("span", "caret", "\u25BE"));
+      b.onclick = (e) => {
+        e.stopPropagation();
+        menuOpen = !menuOpen;
+        render();
+      };
+      wrap2.append(b);
+      if (menuOpen) {
+        const menu = el2("div", "menu");
+        menu.append(el2("div", "body", "Click the Switchboard icon in your Chrome toolbar and paste your pairing token."));
+        const retry = el2("button", "item", "Retry");
+        retry.onclick = () => {
+          menuOpen = false;
+          render();
+          void refresh();
+        };
+        menu.append(retry);
+        wrap2.append(menu);
+      }
+      mount.append(wrap2);
       return;
     }
     if (state.kind === "disconnected") {
-      const b = el("button", "btn connect");
-      b.append(el("span", "glyph"), el("span", void 0, "Connect Switchboard"));
+      const b = el2("button", "btn connect");
+      b.append(el2("span", "glyph"), el2("span", void 0, "Connect Switchboard"));
       b.onclick = doConnect;
       mount.append(b);
       return;
@@ -179,20 +376,21 @@ function mountConnect(target, opts = {}) {
     const rawName = user?.name?.trim();
     const collides = !!rawName && !!project?.name && rawName.toLowerCase() === project.name.toLowerCase();
     const name = !rawName || collides ? "there" : rawName;
-    const wrap = el("div", "wrap");
-    const chip = el("button", "chip");
-    const av = el("div", "av");
+    const wrap = el2("div", "wrap");
+    const chip = el2("button", "chip");
+    const av = el2("div", "av");
     if (user?.avatar) {
-      const img = el("img");
+      const img = el2("img");
       img.src = user.avatar;
       img.alt = name;
       av.append(img);
     } else
       av.textContent = name.charAt(0).toUpperCase();
-    const who = el("div", "who");
-    who.append(el("div", "hi", `Hi ${name}`));
-    who.append(el("div", "proj", project ? project.name : "No context lent"));
-    chip.append(av, who, el("span", "caret", "\u25BE"));
+    const wantsContext = opts.context !== "none";
+    const who = el2("div", "who");
+    who.append(el2("div", "hi", `Hi ${name}`));
+    who.append(el2("div", "proj", wantsContext ? project ? project.name : "No context lent" : "Connected"));
+    chip.append(av, who, el2("span", "caret", "\u25BE"));
     chip.onclick = (e) => {
       e.stopPropagation();
       menuOpen = !menuOpen;
@@ -200,17 +398,19 @@ function mountConnect(target, opts = {}) {
     };
     wrap.append(chip);
     if (menuOpen) {
-      const menu = el("div", "menu");
-      menu.append(el("div", "lbl", "Working on"));
-      const row = el("button", "proj-row");
-      row.append(el("span", void 0, project ? project.name : "Choose a context"));
-      row.append(el("span", "go", project ? "Switch \u25B8" : "Choose \u25B8"));
-      row.onclick = doPick;
-      menu.append(row, el("div", "sep"));
-      const dc = el("button", "item", "Disconnect this app");
+      const menu = el2("div", "menu");
+      if (wantsContext) {
+        menu.append(el2("div", "lbl", "Working on"));
+        const row = el2("button", "proj-row");
+        row.append(el2("span", void 0, project ? project.name : "Choose a context"));
+        row.append(el2("span", "go", project ? "Switch \u25B8" : "Choose \u25B8"));
+        row.onclick = doPick;
+        menu.append(row, el2("div", "sep"));
+      }
+      const dc = el2("button", "item", "Disconnect this app");
       dc.onclick = doDisconnect;
       menu.append(dc);
-      menu.append(el("div", "foot", "Connectors, budgets & activity live in the Switchboard toolbar panel."));
+      menu.append(el2("div", "foot", "Connectors, budgets & activity live in the Switchboard toolbar panel."));
       wrap.append(menu);
     }
     mount.append(wrap);
@@ -222,12 +422,23 @@ function mountConnect(target, opts = {}) {
     destroy: () => {
       destroyed = true;
       document.removeEventListener("click", onDocClick);
+      window.removeEventListener(initEvent, onLateInit);
       host.remove();
     }
   };
 }
 
 // ../../packages/sdk/dist/index.js
+var warnedStorageKeys = /* @__PURE__ */ new Set();
+function warnBadStorageKey(key) {
+  if (isValidStorageKey(key) || warnedStorageKeys.has(key))
+    return;
+  warnedStorageKeys.add(key);
+  const suggestion = String(key).replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "") || "key";
+  console.warn(`[relay.storage] invalid key ${JSON.stringify(key)} \u2014 this write/read WILL be rejected by the daemon and silently do nothing.
+  Keys map 1:1 to files (<key>.json) in this origin's folder, so they must match ${STORAGE_KEY_RE}.
+  ":" is not allowed (illegal on NTFS; "a:b" is Alternate Data Stream syntax on Windows). Try ${JSON.stringify(suggestion)}.`);
+}
 var Relay = class {
   provider;
   constructor(provider) {
@@ -249,6 +460,17 @@ var Relay = class {
   }
   permissions() {
     return this.provider.request({ method: "claude_permissions" });
+  }
+  /** The setup-ladder snapshot (reachable/paired/connected), answered by the EXTENSION from its
+   *  own state — never the daemon — so it resolves fast (<1s) in every degraded state, including
+   *  the ones where every other method would hang. Resolves null when the extension is too old to
+   *  know `claude_health` (or its worker is unreachable): callers MUST treat null as "unknown"
+   *  and fall back to probing permissions() exactly as before — that skew guard is load-bearing
+   *  while store users run an older extension against newer app bundles. */
+  health() {
+    const answer = this.provider.request({ method: "claude_health" }).catch(() => null);
+    const timer = new Promise((resolve) => setTimeout(() => resolve(null), 1500));
+    return Promise.race([answer, timer]);
   }
   /** The paired user's public identity (name/avatar), or null if unavailable. Convenience over
    *  capabilities().user — what the connect chip greets with ("Hi Sameep"). */
@@ -319,14 +541,23 @@ var Relay = class {
    */
   get storage() {
     const req = (params) => this.provider.request({ method: "claude_storage", params });
+    const k = (key) => {
+      warnBadStorageKey(key);
+      return key;
+    };
     return {
-      get: (key) => req({ op: "get", key }).then((r) => r.value ?? null),
-      set: (key, value) => req({ op: "set", key, value }).then(() => void 0),
-      delete: (key) => req({ op: "delete", key }).then((r) => r.ok),
+      get: (key) => req({ op: "get", key: k(key) }).then((r) => r.value ?? null),
+      set: (key, value) => req({ op: "set", key: k(key), value }).then(() => void 0),
+      delete: (key) => req({ op: "delete", key: k(key) }).then((r) => r.ok),
       list: () => req({ op: "list" }).then((r) => r.keys ?? []),
       info: () => req({ op: "info" }).then((r) => r.info),
       /** Point this app's store at a real folder (triggers a path-consent click). */
-      bind: (path) => req({ op: "bind", path }).then((r) => r.info)
+      bind: (path) => req({ op: "bind", path }).then((r) => r.info),
+      /** Open a NATIVE folder chooser on the daemon's machine (macOS today). The user picking a
+       *  folder in an OS dialog that names this origin IS the path consent, so a successful pick
+       *  comes back already bound. Resolves undefined on cancel or when no native picker exists —
+       *  keep a typed-path `bind` as the fallback UI. */
+      pick: (reason) => req({ op: "pick", reason }).then((r) => r.info).catch(() => void 0)
     };
   }
   /**
@@ -343,7 +574,10 @@ var Relay = class {
       publish: (context) => req({ op: "publish", context }).then((r) => r.id),
       list: () => req({ op: "list" }).then((r) => r.contexts ?? []),
       active: () => req({ op: "active" }).then((r) => r.context ?? null),
-      pick: () => req({ op: "pick" }).then((r) => r.context ?? null)
+      pick: () => req({ op: "pick" }).then((r) => r.context ?? null),
+      /** Read ONE context listed via `list()` in full, and make it this app's selection. Needs the
+       *  kind granted at connect (ScopeRequest.contextKinds) — powers in-app brand dropdowns. */
+      use: (id) => req({ op: "use", id }).then((r) => r.context ?? null)
     };
   }
 };
@@ -375,21 +609,178 @@ function whenRelayReady(timeoutMs = 3e3, opts) {
   });
 }
 
+// src/kit/ui.js
+var el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+var str = (s) => String(s ?? "").trim();
+var STYLE_ID = "relay-kit-ui";
+var ACCENT = "var(--accent, var(--lime, #C8F250))";
+var ACCENT_SOFT = "var(--accent-soft, var(--lime-soft, #232B0D))";
+var CSS = `
+/* zero-specificity base: only applies where the shell styles nothing */
+:where(.opts) { display: flex; flex-direction: column; gap: 8px; }
+:where(.opt) { position: relative; border: 1px solid var(--edge, #262C38); background: var(--inset, #070809); border-radius: 14px; padding: 13px 14px; cursor: pointer; transition: border-color .15s, background .15s; }
+:where(.opt:hover) { border-color: var(--edge-soft, #1C212B); }
+:where(.opt.sel) { border-color: ${ACCENT}; background: color-mix(in srgb, ${ACCENT_SOFT} 55%, var(--inset, #070809)); }
+:where(.opt .check) { position: absolute; right: 11px; top: 11px; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--edge, #262C38); display: grid; place-items: center; color: transparent; font: 700 11px/1 var(--sans, sans-serif); }
+:where(.opt.sel .check) { border-color: ${ACCENT}; background: ${ACCENT}; color: var(--page, #0A0C10); }
+:where(.opt .rec) { display: inline-block; font: 500 9px/1 var(--mono, monospace); letter-spacing: .1em; text-transform: uppercase; border-radius: 999px; padding: 3px 7px; margin-bottom: 7px; }
+:where(.opt .o-label) { font: 600 13.5px/1.3 var(--display, sans-serif); color: var(--ink, #E8EDF4); padding-right: 22px; }
+:where(.opt .o-text) { font: 400 13px/1.5 var(--sans, sans-serif); color: var(--ink-sec, #B4BECE); margin-top: 5px; white-space: pre-wrap; word-break: break-word; }
+:where(.opt .o-img) { width: 100%; border-radius: 8px; border: 1px solid var(--edge, #262C38); display: block; margin-top: 8px; }
+:where(.steer) { margin-top: 16px; display: flex; flex-direction: column; gap: 7px; }
+:where(.steer .chips) { display: flex; flex-wrap: wrap; gap: 6px; }
+:where(.steer .chip) { font: 500 11px/1 var(--sans, sans-serif); border: 1px solid var(--edge, #262C38); background: var(--panel, #12151C); color: var(--ink-sec, #B4BECE); border-radius: 999px; padding: 6px 10px; cursor: pointer; }
+:where(.steer .row) { display: flex; gap: 8px; align-items: center; }
+:where(.steer .box) { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; border: 1px solid var(--edge, #262C38); background: var(--panel, #12151C); border-radius: 10px; padding: 8px 11px; }
+:where(.steer input) { flex: 1; min-width: 0; background: none; border: 0; outline: none; color: var(--ink, #E8EDF4); font: 400 12.5px/1.4 var(--sans, sans-serif); }
+:where(.steer .send) { flex: none; font: 600 12px/1 var(--sans, sans-serif); background: ${ACCENT}; color: var(--page, #0A0C10); border: 0; border-radius: 9px; padding: 9px 12px; cursor: pointer; }
+
+/* ---- kit modifiers: normal specificity, these MUST beat the shell ---- */
+/* DRAFTED \u2014 a machine suggestion. Neutral ink on a hairline, never the brand accent (rule 5). */
+.opt .rec.k-draft { color: var(--ink-dim, #99A3B7); background: transparent; border: 1px dashed var(--edge, #262C38); }
+.opt.k-drafted { border-style: dashed; }
+.opt.k-drafted:not(.sel) { background: var(--inset, #070809); }
+/* CHOSEN \u2014 a human clicked. The shell's own .opt.sel accent rules do the painting; this only adds
+   the receipt line, so "who decided this" is never a guess (rule 6). */
+.opt .k-by { display: block; font: 500 9px/1 var(--mono, monospace); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint, #6E7C90); margin-top: 8px; }
+.opt.sel .k-by { color: ${ACCENT}; }
+/* ESCAPE HATCH \u2014 the human's own answer. Reads as an option, never as one of the generated ones. */
+.opt.k-esc { border-style: dashed; cursor: pointer; }
+.opt.k-esc .o-label { color: var(--ink-sec, #B4BECE); }
+.opt.k-esc .k-escrow { display: flex; gap: 8px; align-items: center; margin-top: 9px; }
+.opt.k-esc .k-escrow input { flex: 1; min-width: 0; background: var(--inset, #070809); border: 1px solid var(--edge, #262C38); border-radius: 9px; color: var(--ink, #E8EDF4); font: 400 12.5px/1.4 var(--sans, sans-serif); padding: 9px 11px; outline: none; }
+.opt.k-esc .k-escrow input:focus { border-color: color-mix(in srgb, ${ACCENT} 55%, var(--edge, #262C38)); }
+.opt.k-esc .k-escrow .send { flex: none; font: 600 12px/1 var(--sans, sans-serif); background: ${ACCENT}; color: var(--page, #0A0C10); border: 0; border-radius: 9px; padding: 9px 12px; cursor: pointer; }
+.opt.k-esc .k-escrow .send:disabled { opacity: .5; cursor: default; }
+.opt.k-esc .k-escrow .ghost { flex: none; font: 500 12px/1 var(--sans, sans-serif); background: none; border: 1px solid var(--edge, #262C38); color: var(--ink-dim, #99A3B7); border-radius: 9px; padding: 9px 12px; cursor: pointer; }
+`;
+function ensureStyle() {
+  if (typeof document === "undefined" || document.getElementById(STYLE_ID)) return;
+  const s = document.createElement("style");
+  s.id = STYLE_ID;
+  s.textContent = CSS;
+  (document.head || document.documentElement).append(s);
+}
+function escapeHatch(opts) {
+  ensureStyle();
+  const o = opts || {};
+  const label = o.label || "none of these \u2014 say what you'd do instead";
+  const card2 = el("div", "opt k-esc");
+  card2.append(el("div", "o-label", label));
+  if (o.hint) card2.append(el("div", "o-text", o.hint));
+  const row = el("div", "k-escrow");
+  row.hidden = true;
+  const input = el("input");
+  input.type = "text";
+  input.placeholder = o.placeholder || "describe what you'd do instead\u2026";
+  if (o.prefill) input.value = o.prefill;
+  const send = el("button", "send", o.sendLabel || "use this");
+  send.type = "button";
+  const cancel = el("button", "ghost", "cancel");
+  cancel.type = "button";
+  row.append(input, send, cancel);
+  card2.append(row);
+  const open = () => {
+    if (!row.hidden) return;
+    row.hidden = false;
+    input.focus();
+    input.select();
+  };
+  const close = () => {
+    row.hidden = true;
+  };
+  card2.onclick = (e) => {
+    if (e.target.closest(".k-escrow")) return;
+    open();
+  };
+  card2.onkeydown = (e) => {
+    if (e.target === card2 && (e.key === "Enter" || e.key === " ")) {
+      e.preventDefault();
+      open();
+    }
+  };
+  card2.tabIndex = 0;
+  let busy = false;
+  const submit = () => {
+    const text = str(input.value);
+    if (!text || busy) return;
+    const option = { id: "custom", label: text, text: "", custom: true };
+    const out = typeof o.onSubmit === "function" ? o.onSubmit(text, option) : null;
+    if (out && typeof out.then === "function") {
+      busy = true;
+      const was = send.textContent;
+      send.disabled = true;
+      send.textContent = "\u2026";
+      out.finally(() => {
+        busy = false;
+        send.disabled = false;
+        send.textContent = was;
+        close();
+      });
+    } else {
+      close();
+    }
+  };
+  send.onclick = submit;
+  cancel.onclick = close;
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    }
+  };
+  card2.open = open;
+  card2.close = close;
+  card2.value = () => str(input.value);
+  return card2;
+}
+
+// src/kit/storekey.js
+function migrateLocalKey(oldKey, newKey) {
+  if (oldKey === newKey) return;
+  try {
+    if (localStorage.getItem(newKey) !== null) {
+      localStorage.removeItem(oldKey);
+      return;
+    }
+    const old = localStorage.getItem(oldKey);
+    if (old === null) return;
+    localStorage.setItem(newKey, old);
+    localStorage.removeItem(oldKey);
+  } catch {
+  }
+}
+
 // src/adpulse.js
 var $ = (id) => document.getElementById(id);
 var INSTALL_URL = "https://thelastprompt.ai/switchboard/";
-var STORE_KEY = "adpulse:v1";
+var STORE_KEY = "adpulse-v1";
+migrateLocalKey("adpulse:v1", STORE_KEY);
 var relay = null;
 var notInstalled = false;
 var brand = null;
 var rows = null;
 var rawCsv = "";
 var srcLabel = "";
+var origSource = "";
+var savedAt = 0;
 var report = null;
+var reportFor = null;
+var doing = null;
 var analysing = false;
 var runSeq = 0;
 var pulling = false;
 var pullSeq = 0;
+var autoRan = false;
+var csvSig = () => rawCsv.length + ":" + rawCsv.slice(0, 80);
 var SAMPLE = [
   "Campaign name,Ad set,Amount spent (INR),Impressions,Clicks,CTR,CPC,Purchases,Purchase value,ROAS,Frequency,Date range",
   "Retargeting | Cart + Checkout Abandoners 14d,Warm \u2014 ATC no purchase,84500,412800,9630,2.33%,8.77,396,714900,8.46,3.8,1 Jun 2026 - 30 Jun 2026",
@@ -484,11 +875,14 @@ function loadData(text, source) {
   rows = parsed;
   rawCsv = text;
   srcLabel = source;
+  origSource = source === "restored" ? origSource || "restored" : source;
+  if (source !== "restored") savedAt = Date.now();
   hasAdset = col.adset !== -1;
   $("feed-err").hidden = true;
   renderTape();
   persist();
   reflect();
+  syncStale();
 }
 var hasAdset = true;
 var currency = "INR";
@@ -604,16 +998,26 @@ function renderTapeCaption() {
   } else {
     const b = document.createElement("b");
     b.textContent = srcLabel === "restored" ? "restored from your last session" : srcLabel === "live" ? "pulled live from your Ads Manager \u2014 via your own Meta connector" : "your export";
-    cap.append(b, ` \u2014 ${rows.length} campaigns parsed in this tab, all rows shown.`);
+    let tail = ` \u2014 ${rows.length} campaigns parsed in this tab, all rows shown.`;
+    if (srcLabel === "restored" && savedAt) {
+      const h = Math.round((Date.now() - savedAt) / 36e5);
+      tail = ` \u2014 ${rows.length} campaigns parsed in this tab, all rows shown \xB7 ${h < 1 ? "under an hour" : h + "h"} old.`;
+    }
+    cap.append(b, tail);
   }
 }
+var chipGesture = false;
+$("chip-dock").addEventListener("click", () => {
+  chipGesture = true;
+}, true);
 mountConnect($("chip-dock"), {
-  scope: { reason: "diagnose your Meta ads performance", models: ["sonnet"] },
+  scope: { reason: "diagnose your Meta ads performance", models: ["sonnet"], contextKinds: ["brand"] },
   installUrl: INSTALL_URL,
-  onConnect: (r) => {
+  onConnect: async (r) => {
     relay = r;
     reflect();
-    loadBrand();
+    await loadBrand();
+    proactiveKickoff(chipGesture);
   },
   onDisconnect: () => {
     relay = null;
@@ -631,13 +1035,46 @@ mountConnect($("chip-dock"), {
     const grant = await r.permissions().catch(() => null);
     if (grant) {
       relay = r;
-      loadBrand();
+      await loadBrand();
+      proactiveKickoff(false);
     }
   } else if (r && r.installed === false) {
     notInstalled = true;
   }
   reflect();
 })();
+async function grantCoversCachedPrefix() {
+  if (!relay) return false;
+  let cached = null;
+  try {
+    cached = localStorage.getItem(PREFIX_KEY);
+  } catch {
+  }
+  if (!cached) return false;
+  const grant = await relay.permissions().catch(() => null);
+  return !!grant?.tools?.some((t) => t.name === cached + "*" || String(t.name || "").startsWith(cached));
+}
+async function proactiveKickoff(viaFreshConnect) {
+  if (autoRan || !relay || analysing || pulling) return;
+  autoRan = true;
+  const real = rows && rows.length && srcLabel !== "sample";
+  if (real) {
+    if (origSource === "live" && savedAt && Date.now() - savedAt > 24 * 36e5 && await grantCoversCachedPrefix()) {
+      void pullLive();
+      return;
+    }
+    const fresh = report && reportFor && reportFor.csvSig === csvSig() && reportFor.brand === (brand?.name ?? null);
+    if (!fresh) void analyse();
+    return;
+  }
+  const mayPull = viaFreshConnect || await grantCoversCachedPrefix();
+  if (mayPull && await pullLive({ auto: true })) return;
+  if (!rows || !rows.length) {
+    $("csv-in").value = SAMPLE;
+    ingest(SAMPLE, "sample");
+  }
+  if (rows && rows.length && !analysing && !pulling) await analyse();
+}
 function normalizeBrand(ctx) {
   const d = ctx && ctx.data || {};
   const arr = (v) => Array.isArray(v) ? v.filter(Boolean).map(String) : [];
@@ -656,7 +1093,12 @@ function normalizeBrand(ctx) {
 async function loadBrand() {
   if (!relay) return;
   try {
-    const ctx = await relay.context.active();
+    let ctx = await relay.context.active();
+    if (!ctx && typeof relay.context.list === "function" && typeof relay.context.use === "function") {
+      const metas = await relay.context.list().catch(() => []);
+      const bm = metas.find((m) => (m.kind || "").toLowerCase() === "brand");
+      if (bm) ctx = await relay.context.use(bm.id).catch(() => null);
+    }
     brand = ctx ? normalizeBrand(ctx) : null;
   } catch {
     brand = null;
@@ -664,6 +1106,7 @@ async function loadBrand() {
   renderBrandLine();
   rebuildBrandChips();
   reflect();
+  if (report) renderReport();
 }
 function renderBrandLine() {
   const line = $("brand-line");
@@ -706,6 +1149,7 @@ $("brand-switch").addEventListener("click", async () => {
       renderBrandLine();
       rebuildBrandChips();
       reflect();
+      if (report) renderReport();
     } else b.textContent = prev;
   } catch {
     b.textContent = prev;
@@ -750,6 +1194,7 @@ function reflect() {
   const haveData = !!rows && rows.length > 0;
   $("analyse").disabled = !relay || !haveData || analysing || pulling;
   $("rerun").disabled = !relay || !haveData || analysing || pulling;
+  $("stale-rerun").disabled = !relay || !haveData || analysing || pulling;
   $("pull-live").disabled = !relay || pulling || analysing;
   $("load-sample").hidden = !!relay;
   $("pull-sub").textContent = relay ? "reads your last 30 days through your own Meta connector \u2014 nothing leaves this tab" : "connect Switchboard (top right) to pull your live account \u2014 everything below works without it";
@@ -758,7 +1203,8 @@ function reflect() {
   hint.textContent = "";
   if (relay) {
     const brandBit = brand ? ` Verdicts are judged against ${brand.name}'s positioning.` : "";
-    hint.append("connected \u2014 the diagnosis runs on ", strong("your"), " Claude." + brandBit + (haveData ? "" : " Pull live or paste an export first."));
+    const tail = !haveData ? " Pull live or paste an export first." : srcLabel === "sample" ? " The demo month is diagnosed below \u2014 pull your account to judge your own numbers." : "";
+    hint.append("connected \u2014 the diagnosis runs on ", strong("your"), " Claude." + brandBit + tail);
   } else if (notInstalled) {
     const a = document.createElement("a");
     a.href = INSTALL_URL;
@@ -770,6 +1216,7 @@ function reflect() {
     hint.append("the sample is loaded and explorable \u2014 ", strong("connect Switchboard"), " (top right) to pull your live account and run the diagnosis.");
   }
   if (rows) renderTapeCaption();
+  syncDemo();
 }
 function strong(t) {
   const b = document.createElement("b");
@@ -780,9 +1227,14 @@ function ingest(text, source) {
   try {
     if (!text.trim()) {
       rows = null;
+      rawCsv = "";
+      srcLabel = "";
+      origSource = "";
       $("tape").hidden = true;
       $("feed-err").hidden = true;
+      persist();
       reflect();
+      syncStale();
       return;
     }
     loadData(text, source);
@@ -837,7 +1289,8 @@ feed.addEventListener("drop", (e) => {
   const f = e.dataTransfer?.files?.[0];
   if (f) readFile(f);
 });
-var PREFIX_KEY = "adpulse:meta-prefix";
+var PREFIX_KEY = "adpulse-meta-prefix";
+migrateLocalKey("adpulse:meta-prefix", PREFIX_KEY);
 var PULL_PROMPT = [
   "You are connected to the user's own Meta ads tools (MCP tool names containing things like ads_get_ad_accounts, ads_insights_*). Pull their live campaign performance:",
   "1) Find their ad accounts. If there are several, pick the one with recent spend.",
@@ -887,50 +1340,63 @@ function extractCsv(text) {
   const csv = t.slice(start).trim();
   return csv.split("\n").length >= 2 ? csv : null;
 }
-async function pullLive() {
-  if (!relay || pulling || analysing) return;
+async function pullLive({ auto = false } = {}) {
+  if (!relay || pulling || analysing) return false;
   const myRun = ++pullSeq;
   $("feed-err").hidden = true;
+  let sawOkTool = false, sawDenied = false;
   try {
     const prefix = await discoverPrefix(myRun);
-    if (myRun !== pullSeq || !prefix) return;
+    if (myRun !== pullSeq || !prefix) return false;
     setPull(true, "asking your consent to read the ads connector\u2026");
     await relay.connect({
       reason: "pull your Meta ads performance (read-only) to diagnose it",
       tools: [prefix + "*"],
       models: ["sonnet"]
     });
-    if (myRun !== pullSeq) return;
+    if (myRun !== pullSeq) return false;
     setPull(true, "opening your ad account\u2026");
     let text = "";
     for await (const d of relay.stream({ prompt: PULL_PROMPT, agentic: true })) {
-      if (myRun !== pullSeq) return;
+      if (myRun !== pullSeq) return false;
       if (d.type === "tool_proposed") setPull(true, "calling " + d.call.name.split("__").pop() + "\u2026");
-      else if (d.type === "tool_result" && !d.result.ok) setPull(true, "\u26D4 " + (d.result.error?.message || "denied") + " \u2014 continuing\u2026");
-      else if (d.type === "text") text += d.text;
+      else if (d.type === "tool_result") {
+        if (d.result.ok) sawOkTool = true;
+        else {
+          sawDenied = true;
+          setPull(true, "\u26D4 " + (d.result.error?.message || "denied") + " \u2014 continuing\u2026");
+        }
+      } else if (d.type === "text") text += d.text;
       else if (d.type === "error") throw new Error(d.error?.message || "stream error");
     }
-    if (myRun !== pullSeq) return;
+    if (myRun !== pullSeq) return false;
     const csv = extractCsv(text);
     if (!csv) throw new Error("your Claude answered but not with a parseable CSV \u2014 pull again, it usually lands on the second pass.");
     $("csv-in").value = csv;
     ingest(csv, "live");
+    if (!rows || !rows.length) throw new Error("the pulled CSV had no campaign rows in it.");
     $("tape").scrollIntoView({ behavior: "smooth", block: "start" });
-    if (rows && rows.length && !analysing) void analyse();
+    if (!analysing) void analyse();
+    return true;
   } catch (err) {
-    if (myRun !== pullSeq) return;
-    try {
-      localStorage.removeItem(PREFIX_KEY);
-    } catch {
+    if (myRun !== pullSeq) return false;
+    const msg = String(err?.message || err);
+    if (sawDenied && !sawOkTool || /unknown tool|no such tool|not allowed|not found/i.test(msg)) {
+      try {
+        localStorage.removeItem(PREFIX_KEY);
+      } catch {
+      }
     }
     const fe = $("feed-err");
     fe.hidden = false;
-    fe.textContent = "\u26A0 live pull failed: " + String(err?.message || err).slice(0, 240);
+    fe.classList.toggle("soft", auto);
+    fe.textContent = auto ? "\xB7 couldn't reach a live account (" + msg.slice(0, 160) + ") \u2014 diagnosing the demo month below instead. \u26A1 Pull from Ads Manager retries any time." : "\u26A0 live pull failed: " + msg.slice(0, 240);
+    return false;
   } finally {
     if (myRun === pullSeq) setPull(false);
   }
 }
-$("pull-live").addEventListener("click", pullLive);
+$("pull-live").addEventListener("click", () => void pullLive());
 $("pull-cancel").addEventListener("click", () => {
   pullSeq++;
   setPull(false);
@@ -1014,6 +1480,8 @@ async function analyse() {
     }
     if (!data) throw new Error("the model didn't return clean JSON \u2014 hit \u21BB RETRY, it usually lands on the second pass.");
     report = normalize(data);
+    doing = null;
+    reportFor = { csvSig: csvSig(), brand: brand?.name ?? null, source: srcLabel };
     persist();
     renderReport();
     $("report").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1027,6 +1495,7 @@ async function analyse() {
 $("analyse").addEventListener("click", analyse);
 $("rerun").addEventListener("click", analyse);
 $("retry").addEventListener("click", analyse);
+$("stale-rerun").addEventListener("click", analyse);
 $("cancel").addEventListener("click", () => {
   runSeq++;
   setLive(false);
@@ -1041,7 +1510,10 @@ function showError(err) {
   msg.textContent = "";
   const b = document.createElement("b");
   b.textContent = "Diagnosis failed. ";
-  msg.append(b, String(err?.message || err).slice(0, 240));
+  let detail = String(err?.message || err).slice(0, 240);
+  if (!relay) detail += " \u2014 reconnect Switchboard (top right) to retry.";
+  msg.append(b, detail);
+  $("retry").hidden = !relay || !rows;
 }
 function normalize(d) {
   const clampArr = (a) => Array.isArray(a) ? a : [];
@@ -1068,10 +1540,10 @@ function normalize(d) {
 }
 var SVG_NS = "http://www.w3.org/2000/svg";
 function svgEl(tag, attrs, text) {
-  const el = document.createElementNS(SVG_NS, tag);
-  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
-  if (text != null) el.textContent = text;
-  return el;
+  const el2 = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el2.setAttribute(k, v);
+  if (text != null) el2.textContent = text;
+  return el2;
 }
 function renderDial(score) {
   const s = Math.max(0, Math.min(100, Math.round(Number(score) || 0)));
@@ -1094,28 +1566,28 @@ function burnLine(b) {
   return s && s !== "undefined" && s !== "null" ? "\u25BC " + s.slice(0, 60) : null;
 }
 function card(kind, title, detail, burn) {
-  const el = document.createElement("div");
-  el.className = "card " + kind;
+  const el2 = document.createElement("div");
+  el2.className = "card " + kind;
   const t = document.createElement("div");
   t.className = "t";
   t.textContent = title;
   const d = document.createElement("div");
   d.className = "d";
   d.textContent = detail;
-  el.append(t, d);
+  el2.append(t, d);
   if (burn) {
     const bl = document.createElement("div");
     bl.className = "burn";
     bl.textContent = burn;
-    el.append(bl);
+    el2.append(bl);
   }
-  return el;
+  return el2;
 }
 function noneCard(text) {
-  const el = document.createElement("div");
-  el.className = "none";
-  el.textContent = text;
-  return el;
+  const el2 = document.createElement("div");
+  el2.className = "none";
+  el2.textContent = text;
+  return el2;
 }
 function tagEl(cls, text) {
   const t = document.createElement("span");
@@ -1123,11 +1595,39 @@ function tagEl(cls, text) {
   t.textContent = text;
   return t;
 }
+function reportIsStale() {
+  return !!report && (!reportFor || reportFor.csvSig !== csvSig() || reportFor.brand !== (brand?.name ?? null));
+}
+function syncDemo() {
+  const note = $("demo-note");
+  if (!note) return;
+  const onDemo = !!report && (reportFor ? reportFor.source === "sample" : srcLabel === "sample");
+  note.hidden = !onDemo || $("report").hidden;
+  $("demo-pull").disabled = !relay || pulling || analysing;
+}
+$("demo-pull").addEventListener("click", () => void pullLive());
+$("demo-paste").addEventListener("click", () => {
+  $("paste-alt").open = true;
+  $("csv-in").focus();
+  $("paste-alt").scrollIntoView({ behavior: "smooth", block: "center" });
+});
+function syncStale() {
+  const note = $("stale-note");
+  if (!report || $("report").hidden) {
+    note.hidden = true;
+    return;
+  }
+  const stale = reportIsStale();
+  note.hidden = !stale;
+  if (!stale) return;
+  $("stale-why").textContent = !reportFor || reportFor.csvSig !== csvSig() ? "the numbers changed since this diagnosis" : `this verdict was generated for ${reportFor.brand ?? "no brand"} \u2014 you're now on ${brand?.name ?? "no brand"}`;
+}
 function renderReport() {
   if (!report) return;
   renderDial(report.score);
   $("headline").textContent = report.headline;
-  $("verdict-sig").textContent = brand ? `account health \xB7 verdict for ${brand.name}` : "account health \xB7 verdict";
+  const judgedFor = reportFor ? reportFor.brand : brand?.name ?? null;
+  $("verdict-sig").textContent = judgedFor ? `account health \xB7 verdict for ${judgedFor}` : "account health \xB7 verdict";
   const wins = $("wins");
   wins.textContent = "";
   if (report.wins.length) report.wins.forEach((w) => wins.append(card("win", w.title, w.detail)));
@@ -1140,8 +1640,13 @@ function renderReport() {
   acts.textContent = "";
   if (report.actions.length) {
     report.actions.forEach((a, i) => {
+      const mine = doing != null && doing === a.title;
+      const drafted = !mine && i === 0;
       const row = document.createElement("div");
-      row.className = "action";
+      row.className = "action" + (mine ? " mine" : "") + (drafted ? " drafted" : "");
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-pressed", mine ? "true" : "false");
       const idx = document.createElement("div");
       idx.className = "idx";
       idx.textContent = String(i + 1).padStart(2, "0");
@@ -1155,13 +1660,40 @@ function renderReport() {
         tagEl(a.impact === "high" ? "hi" : "med", "impact " + a.impact),
         tagEl(a.effort === "low" ? "lo" : a.effort === "high" ? "hard" : "dim", "effort " + a.effort)
       );
+      if (drafted) body.append(tagEl("draft", "recommended first"));
+      if (mine) body.append(tagEl("star", "\u2605 your call \u2014 doing this first"));
       const d = document.createElement("div");
       d.className = "d";
       d.textContent = a.detail;
       body.append(d);
+      const claim = () => {
+        doing = mine ? null : a.title;
+        persist();
+        renderReport();
+      };
+      row.addEventListener("click", claim);
+      row.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          claim();
+        }
+      });
       row.append(idx, body);
       acts.append(row);
     });
+    acts.append(escapeHatch({
+      label: "none of these \u2014 say what you'd do instead",
+      hint: "your words become the analysis focus and the diagnosis re-runs against them",
+      placeholder: "e.g. consolidate the prospecting campaigns into one and re-test the hook\u2026",
+      sendLabel: "re-run on this",
+      onSubmit: (text) => {
+        $("focus-in").value = text;
+        syncChips();
+        doing = null;
+        persist();
+        return analyse();
+      }
+    }));
   } else acts.append(noneCard("no actions returned \u2014 re-run the diagnosis"));
   const vbox = $("verdicts");
   vbox.textContent = "";
@@ -1195,15 +1727,24 @@ function renderReport() {
   vbox.append(table);
   $("report").hidden = false;
   reflect();
+  syncStale();
+  syncDemo();
 }
 function persist() {
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify({
       csv: rawCsv.length <= 2e5 ? rawCsv : "",
       source: srcLabel,
+      origSource,
+      // where the data ORIGINALLY came from, across restore cycles
       focus: $("focus-in").value,
       report,
-      at: Date.now()
+      reportFor,
+      // provenance so a restored report can be checked against restored data
+      doing,
+      // the move the founder claimed — a human decision, so it survives
+      at: savedAt || Date.now()
+      // when the DATA was ingested — not when the focus last changed
     }));
   } catch {
   }
@@ -1215,6 +1756,10 @@ function persist() {
   } catch {
   }
   if (saved?.report) report = saved.report ? normalize(saved.report) : null;
+  reportFor = saved?.reportFor && typeof saved.reportFor === "object" ? saved.reportFor : null;
+  doing = typeof saved?.doing === "string" ? saved.doing : null;
+  origSource = typeof saved?.origSource === "string" ? saved.origSource : "";
+  savedAt = Number(saved?.at) || 0;
   $("focus-in").value = saved?.focus || "Find wasted spend";
   syncChips();
   if (saved?.csv) {
